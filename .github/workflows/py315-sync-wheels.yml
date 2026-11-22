@@ -1,0 +1,110 @@
+name: Python 3.15 sync wheels
+
+on:
+    pull_request:
+        paths:
+            - .github/workflows/py315-sync-wheels.yml
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+env:
+    RELEASE_VERSION: "2.6.1.dev1"
+
+jobs:
+    build:
+        name: valkey-glide-sync cp315 ${{ matrix.name }}
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 120
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: manylinux aarch64
+                      runner: ubuntu-24.04-arm
+                      named_os: linux
+                    - name: macOS arm64
+                      runner: macos-15
+                      named_os: darwin
+        steps:
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: "true"
+
+            - name: Set the package version for Python
+              working-directory: ./python
+              run: |
+                  for package in glide-async glide-sync glide-shared; do
+                    perl -0pi -e 's/^dynamic = \[\s*"version"\s*\]/version = "$ENV{RELEASE_VERSION}"/m' "./$package/pyproject.toml"
+                    grep -n '^version' "./$package/pyproject.toml"
+                  done
+
+            - name: Update package version in config.toml for the sync client
+              uses: ./.github/actions/update-glide-version
+              with:
+                  folder_path: "${{ github.workspace }}/ffi/.cargo"
+                  named_os: ${{ matrix.named_os }}
+
+            - name: Set up Python 3.15
+              id: setup_python
+              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+              with:
+                  python-version: "3.15"
+
+            # dev.py and its dev requirements run on the default interpreter; 3.15 only builds the wheel
+            - name: Set up Python 3.12
+              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+              with:
+                  python-version: "3.12"
+
+            - name: Install protoc 3.20.0
+              run: |
+                  PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+                  case "$(uname -s)" in Linux) OS_PREFIX="linux" ;; Darwin) OS_PREFIX="osx" ;; esac
+                  PROTOC_ZIP="protoc-3.20.0-${OS_PREFIX}-aarch_64.zip"
+                  curl -LO "$PB_REL/download/v3.20.0/$PROTOC_ZIP"
+                  sudo mkdir -p /opt/protoc
+                  sudo unzip -o "$PROTOC_ZIP" -d /opt/protoc
+                  echo "/opt/protoc/bin" >> "$GITHUB_PATH"
+
+            - name: Generate protobuf files
+              working-directory: ./python
+              run: |
+                  protoc --version
+                  python3 dev.py protobuf
+
+            - name: Include protobuf files in the package
+              working-directory: ./python
+              run: |
+                  perl -ni -e 'print unless /pb2\.py/' .gitignore
+                  ln -sf .gitignore glide-sync/.gitignore
+                  cp README.md glide-sync/README.md
+
+            - name: Install cibuildwheel
+              run: ${{ steps.setup_python.outputs.python-path }} -m pip install "cibuildwheel>=4.0.0,<4.3"
+
+            - name: Build Python Sync client wheels
+              run: ${{ steps.setup_python.outputs.python-path }} -m cibuildwheel python/glide-sync --output-dir python/glide-sync/wheels
+              env:
+                  CIBW_BUILD: "cp315-*"
+                  CIBW_SKIP: "*-musl* *i686* *i386*"
+                  CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
+                  CIBW_ARCHS_LINUX: auto
+                  CIBW_ARCHS_MACOS: auto
+                  MACOSX_DEPLOYMENT_TARGET: "11.0"
+                  CIBW_ENVIRONMENT: RELEASE_MODE=1 GLIDE_SYNC_RDMA=1
+
+            - name: Smoke test wheels
+              run: |
+                  PYTHON=${{ steps.setup_python.outputs.python-path }}
+                  $PYTHON -m venv /tmp/smoke-sync
+                  /tmp/smoke-sync/bin/pip install --find-links python/glide-sync/wheels "valkey-glide-sync==${RELEASE_VERSION}"
+                  /tmp/smoke-sync/bin/python -c "from glide_sync import GlideClient; print('Sync smoke test passed')"
+
+            - name: Upload Python Sync client wheels
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: wheels-cp315-${{ matrix.named_os }}
+                  path: python/glide-sync/wheels
